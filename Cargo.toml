@@ -1,0 +1,15 @@
+[package]
+name = "sendgrid-manager"
+version = "0.1.0"
+authors = ["Vincent Hanquez <vincent@typed.io>"]
+edition = "2018"
+
+[dependencies]
+clap = "2"
+sendgrid = { git = "https://github.com/hextrust/sendgrid-rs", branch = "master-forked", features = ["async"] }
+console = "0.13"
+dialoguer = "0.7"
+indicatif = "0.15"
+tokio = { version = "0.2", features = ["full"] }
+thiserror = "1"
+anyhow = "1"
