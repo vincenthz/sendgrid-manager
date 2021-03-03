@@ -137,7 +137,7 @@ async fn check_against_local(
 
     println!(
         "{} local templates found in {}",
-        local_templates.len(),
+        ansi_term::Color::Yellow.paint(format!("{}", local_templates.len())),
         dir.to_str().expect("valid utf8 dir")
     );
 
@@ -149,21 +149,29 @@ async fn check_against_local(
         .await
         .expect("sendgrid list result");
 
-    println!("{} remote templates found", remote_templates.len());
+    println!(
+        "{} remote templates found",
+        ansi_term::Color::Yellow.paint(format!("{}", remote_templates.len()))
+    );
 
     let remote_templates = list_version_remote_active(&sg_api_key, &remote_templates).await;
 
-    for ltmp in local_templates.values() {
+    for (i, ltmp) in local_templates.values().enumerate() {
+        let identifier = format!(
+            "[{}/{}]",
+            ansi_term::Color::Yellow.paint(format!("{}", i)),
+            ansi_term::Color::Yellow.paint(format!("{}", local_templates.len())),
+        );
         match remote_templates.iter().find(|l| l.name == ltmp.name) {
             None => {
-                println!("cannot find remote for \"{}\"", ltmp.name)
+                println!("{} cannot find remote for \"{}\"", identifier, ltmp.name)
             }
             Some(found) => {
                 let content_match = &ltmp.html_body == found.html_content.as_deref().unwrap_or("")
                     && &ltmp.plain_body == found.plain_content.as_deref().unwrap_or("");
                 println!(
-                    "found local \"{}\" as remote={} with content matching {}",
-                    ltmp.name, found.template_id, content_match
+                    "{} found local \"{}\" as remote={} with content matching {}",
+                    identifier, ltmp.name, found.template_id, content_match
                 )
             }
         }
