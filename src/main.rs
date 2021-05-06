@@ -1,9 +1,29 @@
+use anyhow::bail;
 use clap::{App, Arg};
+
+use console::{style, Emoji};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+use futures::future::join_all;
 use sendgrid::template;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod manage;
+
+static LOOKING_GLASS: Emoji<'_, '_> = Emoji("🔍  ", "");
+static SPARKLE: Emoji<'_, '_> = Emoji("✨ ", ":-)");
+static BAD: Emoji<'_, '_> = Emoji("❌ ", "BAD");
+static OK: Emoji<'_, '_> = Emoji("✅ ", "OK");
+static DOWNLOAD: Emoji<'_, '_> = Emoji("🌍 ", "Download");
+
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::default_spinner()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+        .template("{prefix:.bold.dim} {spinner} {wide_msg}")
+}
 
 pub fn read_all_templates<P: AsRef<Path>>(dir: P) -> HashMap<String, manage::Template> {
     let p: &Path = dir.as_ref();
@@ -32,13 +52,14 @@ pub fn read_all_templates<P: AsRef<Path>>(dir: P) -> HashMap<String, manage::Tem
     templates
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> anyhow::Result<()> {
     const ARG_API_KEY: &str = "API-KEY";
     const ARG_DIR: &str = "DIR";
 
     const SUBCMD_SYNC_TO_DIR: &str = "sync-to-dir";
     const SUBCMD_CHECK: &str = "check";
+
+    const SUBCMDS: &[&str] = &[SUBCMD_SYNC_TO_DIR, SUBCMD_CHECK];
 
     let app = App::new("sendgrid-manager")
         .version("0.1")
@@ -53,37 +74,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .takes_value(true),
         )
         .subcommand(
-            App::new(SUBCMD_SYNC_TO_DIR).arg(
-                Arg::new(ARG_DIR)
-                    .takes_value(true)
-                    .required(true)
-                    .value_name("DIR")
-                    .about("directory where the template will be stored"),
-            ),
+            App::new(SUBCMD_SYNC_TO_DIR)
+                .about("synchronise the templates on sendgrid to a local directory")
+                .arg(
+                    Arg::new(ARG_DIR)
+                        .takes_value(true)
+                        .required(true)
+                        .value_name("DIR")
+                        .about("directory where the template will be stored"),
+                ),
         )
         .subcommand(
-            App::new(SUBCMD_CHECK).arg(
-                Arg::new(ARG_DIR)
-                    .takes_value(true)
-                    .required(true)
-                    .value_name("DIR")
-                    .about("directory where the template are stored"),
-            ),
+            App::new(SUBCMD_CHECK)
+                .about("check the local directory templates against the one of the sendgrid")
+                .arg(
+                    Arg::new(ARG_DIR)
+                        .takes_value(true)
+                        .required(true)
+                        .value_name("DIR")
+                        .about("directory where the template are stored"),
+                ),
         );
     let matches = app.get_matches();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .worker_threads(4)
+        .enable_time()
+        .enable_io()
+        .build()
+        .expect("failed to create runtime");
 
     if let Some(m) = matches.subcommand_matches(SUBCMD_SYNC_TO_DIR) {
         let api_key = matches.value_of(ARG_API_KEY);
         let dir = m.value_of(ARG_DIR).unwrap();
-        sync_to_directory(api_key, dir.as_ref()).await
+        let dir = PathBuf::from(dir);
+
+        rt.block_on(sync_to_directory(api_key, dir))
     } else if let Some(m) = matches.subcommand_matches(SUBCMD_CHECK) {
         let api_key = matches.value_of(ARG_API_KEY);
         let dir = m.value_of(ARG_DIR).unwrap();
-        check_against_local(api_key, dir.as_ref()).await
+        let dir = PathBuf::from(dir);
+        rt.block_on(check_against_local(api_key, dir))
     } else if let Some(name) = matches.subcommand_name() {
-        panic!("unknown command {}", name);
+        bail!("unknown command {}\nexisting commands: {:?}", name, SUBCMDS)
     } else {
-        panic!("no command");
+        bail!("no command specified");
     }
 }
 
@@ -127,10 +162,8 @@ async fn list_version_remote_active(
     found
 }
 
-async fn check_against_local(
-    api_key: Option<&str>,
-    dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn check_against_local(api_key: Option<&str>, dir: PathBuf) -> anyhow::Result<()> {
+    let dir = dir.as_path();
     let sg_api_key = get_api_key(api_key);
 
     let local_templates = read_all_templates(dir);
@@ -172,87 +205,162 @@ async fn check_against_local(
     Ok(())
 }
 
-async fn sync_to_directory(
-    api_key: Option<&str>,
-    dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn get_template(
+    dir: PathBuf,
+    sg_api_key: Arc<Mutex<String>>,
+    _i: usize,
+    t: sendgrid::template::Template,
+    pb: &ProgressBar,
+) -> Result<(), std::io::Error> {
+    /*
+    println!("####################################################################");
+    println!("ID         : {}", t.id);
+    println!("NAME       : {}", t.name);
+    println!("Generation : {:?}", t.generation);
+    println!("Updated    : {:?}", t.updated_at);
+    println!("Versions   : {}", t.versions.len());
+    */
+    if t.versions.len() == 0 {
+        return Ok(());
+    }
+
+    let active_versions = t
+        .versions
+        .iter()
+        .filter(|v| v.active == 1)
+        .collect::<Vec<_>>();
+    if active_versions.len() == 0 {
+        pb.finish_with_message(&format!("{} error: no active version {}", BAD, t.name));
+        return Ok(());
+    }
+    if active_versions.len() > 1 {
+        pb.finish_with_message(&format!(
+            "{} error: multiple active versions: {}",
+            BAD, t.name
+        ));
+        return Ok(());
+    }
+
+    let active = active_versions[0];
+
+    //println!("   * id={}", active.id);
+    //println!("     name={}", active.name);
+    //println!("     temp={}", active.template_id);
+    //println!("     active={}", active.active);
+
+    pb.set_message(&format!("{} waiting {}", DOWNLOAD, t.name));
+    let long = {
+        loop {
+            match sg_api_key.try_lock() {
+                Ok(key) => {
+                    pb.set_message(&format!("{} fetching {}", DOWNLOAD, t.name));
+                    let v = template::get_version(&key, &t.id, &active.id)
+                        .await
+                        .expect("sendgrid get version");
+                    pb.set_message(&format!("{} analysing {}", LOOKING_GLASS, t.name));
+                    break v;
+                }
+                Err(_) => {
+                    pb.inc(1);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await
+                }
+            }
+        }
+    };
+
+    let mut filename = PathBuf::from(dir);
+    filename.push(format!("{}.mailtemplate", t.id));
+
+    let template = manage::Template {
+        name: long.name,
+        plain_body: long.plain_content.unwrap(),
+        html_body: long.html_content.unwrap(),
+    };
+
+    if let Ok(r) = manage::read_template(&filename) {
+        if let Ok(r_templ) = r {
+            if &r_templ == &template {
+                pb.finish_with_message(&format!("{} same template {}", OK, t.name));
+                return Ok(());
+            }
+            let plain_body_diff = r_templ.plain_body != template.plain_body;
+            let html_body_diff = r_templ.html_body != template.html_body;
+
+            let mut tmp_filename = filename.clone();
+            tmp_filename.set_extension("mailtemplate.tmp");
+
+            //println!("WRITING tmp file {:?}", tmp_filename.as_path().to_str());
+            manage::write_template(&tmp_filename, &template).unwrap();
+            if plain_body_diff && html_body_diff {
+                pb.finish_with_message(&format!(
+                    "{} html and plain bodies differs, writing tmp file {}",
+                    BAD,
+                    tmp_filename.as_path().to_str().unwrap()
+                ));
+                Ok(())
+            } else {
+                pb.finish_with_message(&format!(
+                    "{} plain-body={} html-body={}. writing tmp file {}",
+                    BAD,
+                    plain_body_diff,
+                    html_body_diff,
+                    tmp_filename.as_path().to_str().unwrap()
+                ));
+                Ok(())
+            }
+        } else {
+            pb.finish_with_message(&format!("{} error while reading template {:?}", BAD, r));
+            Ok(())
+        }
+    } else {
+        manage::write_template(filename, &template)?;
+        pb.finish_with_message(&format!("{} downloaded new {}", SPARKLE, t.name));
+        Ok(())
+    }
+}
+
+async fn sync_to_directory(api_key: Option<&str>, dir: PathBuf) -> anyhow::Result<()> {
+    //    let dir = dir.as_path();
     let sg_api_key = get_api_key(api_key);
+
+    println!(
+        "{} {}Gathering list of templates from server...",
+        style("* ").bold().dim(),
+        LOOKING_GLASS
+    );
 
     let templates = template::list(&sg_api_key)
         .await
         .expect("sendgrid list result");
 
-    for t in templates {
-        println!("####################################################################");
-        println!("ID         : {}", t.id);
-        println!("NAME       : {}", t.name);
-        println!("Generation : {:?}", t.generation);
-        println!("Updated    : {:?}", t.updated_at);
-        println!("Versions   : {}", t.versions.len());
-        if t.versions.len() == 0 {
-            continue;
-        }
+    let sg_api_key = Arc::new(Mutex::new(sg_api_key));
 
-        let active_versions = t
-            .versions
-            .iter()
-            .filter(|v| v.active == 1)
-            .collect::<Vec<_>>();
-        if active_versions.len() == 0 {
-            println!("**** no active version ****");
-            continue;
-        }
+    let m = MultiProgress::new();
 
-        if active_versions.len() > 1 {
-            println!(
-                "**** multiple active versions {} ****",
-                active_versions.len()
-            );
-            continue;
-        }
+    let nb_templates = templates.len();
+    let mut join_handle = Vec::new();
+    for (i, t) in templates.into_iter().enumerate() {
+        let pb = m.add(ProgressBar::new(3));
+        pb.set_style(spinner_style());
+        pb.set_prefix(&format!("[{}/{}] {}", i, nb_templates, t.id));
+        pb.set_message(&format!("{}", t.name));
 
-        let active = active_versions[0];
-
-        println!("   * id={}", active.id);
-        println!("     name={}", active.name);
-        println!("     temp={}", active.template_id);
-        println!("     active={}", active.active);
-
-        let long = template::get_version(&sg_api_key, &t.id, &active.id)
-            .await
-            .expect("sendgrid get version");
-
-        let mut filename = PathBuf::from(dir);
-        filename.push(format!("{}.mailtemplate", t.id));
-
-        let template = manage::Template {
-            name: long.name,
-            plain_body: long.plain_content.unwrap(),
-            html_body: long.html_content.unwrap(),
-        };
-
-        if let Ok(r) = manage::read_template(&filename) {
-            if let Ok(r_templ) = r {
-                if &r_templ == &template {
-                    println!("same template");
-                    continue;
-                }
-                if r_templ.plain_body != template.plain_body {
-                    println!("plain body vary");
-                }
-                if r_templ.html_body != template.html_body {
-                    println!("html body vary");
-                }
-                let mut tmp_filename = filename.clone();
-                tmp_filename.set_extension(".mailtemplate.tmp");
-                println!("WRITING tmp file {:?}", tmp_filename.as_path().to_str());
-                manage::write_template(&tmp_filename, &template).unwrap();
-            } else {
-                println!("error while reading template {:?}", r)
+        let dir_clone = dir.clone();
+        let sg_api_clone: Arc<Mutex<String>> = sg_api_key.clone();
+        let handle = tokio::spawn(async move {
+            let r = get_template(dir_clone, sg_api_clone, i, t, &pb).await;
+            if let Err(e) = r {
+                pb.finish_with_message(&format!("thread issue: {}", e));
             }
-        } else {
-            manage::write_template(filename, &template).unwrap();
-        }
+            ()
+        });
+        join_handle.push(handle);
     }
+    let end = tokio::task::spawn_blocking(move || m.join());
+
+    for r in join_all(join_handle).await {
+        r.unwrap()
+    }
+    end.await.unwrap().unwrap();
     Ok(())
 }
